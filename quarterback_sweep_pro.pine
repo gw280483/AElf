@@ -1,0 +1,460 @@
+//@version=6
+indicator("QUARTERBACK SWEEP PRO", overlay=true, max_labels_count=500, max_lines_count=500, max_boxes_count=300)
+
+//────────────────────────────────────────────────────────────
+// INPUTS
+//────────────────────────────────────────────────────────────
+refTF              = input.timeframe("D", "Reference TF")
+requireMidConfirm  = input.bool(true, "Require midpoint confirm")
+useMomentumConfirm = input.bool(false, "Use momentum confirm")
+momLen             = input.int(14, "Momentum length", minval=2)
+momMin             = input.float(0.0, "Momentum threshold", step=0.1)
+
+entryIsTouch       = input.bool(true, "Entry trigger = touch")
+qbShowOverlay      = input.bool(true, "Show overlay")
+overlayMaxBars     = input.int(10, "Overlay max bars", minval=1, maxval=10)
+
+qbShowTable        = input.bool(true, "Show table")
+tblPosOpt          = input.string("Top Right", "Table position", options=[
+    "Top Right","Top Left","Bottom Right","Bottom Left",
+    "Middle Right","Middle Left","Top Center","Bottom Center","Center"
+])
+tblSizeOpt         = input.string("Tiny", "Table size", options=["Tiny","Small","Normal"])
+
+// Liquidity detection
+pivotLen           = input.int(4, "Pivot strength", minval=1, maxval=10)
+eqTolTicks         = input.int(2, "EQH/EQL tolerance (ticks)", minval=0, maxval=20)
+adrLen             = input.int(14, "ADR length", minval=2, maxval=100)
+adrMult            = input.float(1.0, "ADR multiplier", step=0.1)
+
+//────────────────────────────────────────────────────────────
+// HELPERS
+//────────────────────────────────────────────────────────────
+f_pos(_s) => _s == "Top Left" ? position.top_left :_s == "Top Right" ? position.top_right :_s == "Bottom Left" ? position.bottom_left :_s == "Bottom Right" ? position.bottom_right :_s == "Middle Right" ? position.middle_right :_s == "Middle Left" ? position.middle_left :_s == "Top Center" ? position.top_center :_s == "Bottom Center" ? position.bottom_center :position.middle_center
+
+f_sz(_s) =>
+    _s == "Small" ? size.small : _s == "Normal" ? size.normal : size.tiny
+
+fmt(x) =>
+    na(x) ? "—" : str.tostring(x, format.mintick)
+
+touch(_lvl) =>
+    low <= _lvl and high >= _lvl
+
+touchOrClose(_lvl, _isTouch) =>
+    _isTouch ? touch(_lvl) :
+     ((close >= _lvl and close[1] < _lvl) or (close <= _lvl and close[1] > _lvl))
+
+clamp01(x) =>
+    math.min(math.max(x, 0.0), 1.0)
+
+//────────────────────────────────────────────────────────────
+// SINGLE SOURCE OF TRUTH: PREVIOUS HTF CANDLE
+//────────────────────────────────────────────────────────────
+rangeHigh = request.security(syminfo.tickerid, refTF, high[1], barmerge.gaps_off, barmerge.lookahead_off)
+rangeLow  = request.security(syminfo.tickerid, refTF, low[1],  barmerge.gaps_off, barmerge.lookahead_off)
+
+haveRange = not na(rangeHigh) and not na(rangeLow) and rangeHigh > rangeLow
+rng       = haveRange ? math.max(rangeHigh - rangeLow, syminfo.mintick) : na
+mid       = haveRange ? (rangeLow + rng * 0.50) : na
+
+entryLong  = haveRange ? (rangeLow  + rng * 0.25) : na
+entryShort = haveRange ? (rangeHigh - rng * 0.25) : na
+tp1Level   = mid
+tp2Long    = rangeHigh
+tp2Short   = rangeLow
+
+// Stop = 12.5% of entry price
+stopLong  = not na(entryLong)  ? entryLong  * (1.0 - 0.125) : na
+stopShort = not na(entryShort) ? entryShort * (1.0 + 0.125) : na
+
+//────────────────────────────────────────────────────────────
+// LIQUIDITY SOURCES
+//────────────────────────────────────────────────────────────
+prevDayH = request.security(syminfo.tickerid, "D", high[1], barmerge.gaps_off, barmerge.lookahead_off)
+prevDayL = request.security(syminfo.tickerid, "D", low[1],  barmerge.gaps_off, barmerge.lookahead_off)
+prevWkH  = request.security(syminfo.tickerid, "W", high[1], barmerge.gaps_off, barmerge.lookahead_off)
+prevWkL  = request.security(syminfo.tickerid, "W", low[1],  barmerge.gaps_off, barmerge.lookahead_off)
+dayOpen  = request.security(syminfo.tickerid, "D", open,    barmerge.gaps_off, barmerge.lookahead_off)
+
+newDay = ta.change(time("D")) != 0
+
+var float curDayH = na
+var float curDayL = na
+if newDay
+    curDayH := high
+    curDayL := low
+else
+    curDayH := na(curDayH) ? high : math.max(curDayH, high)
+    curDayL := na(curDayL) ? low  : math.min(curDayL, low)
+
+// ADR
+dRange = request.security(syminfo.tickerid, "D", high - low, barmerge.gaps_off, barmerge.lookahead_off)
+adrValue = ta.sma(dRange, adrLen)
+adrU   = (not na(dayOpen) and not na(adrValue)) ? (dayOpen + adrValue * adrMult) : na
+adrL   = (not na(dayOpen) and not na(adrValue)) ? (dayOpen - adrValue * adrMult) : na
+
+// Swings + EQH/EQL
+pivH = ta.pivothigh(high, pivotLen, pivotLen)
+pivL = ta.pivotlow(low,  pivotLen, pivotLen)
+
+var float lastPH = na
+var float prevPH = na
+var float lastPL = na
+var float prevPL = na
+
+if not na(pivH)
+    prevPH := lastPH
+    lastPH := pivH
+
+if not na(pivL)
+    prevPL := lastPL
+    lastPL := pivL
+
+tol = eqTolTicks * syminfo.mintick
+eqHigh = (not na(lastPH) and not na(prevPH) and math.abs(lastPH - prevPH) <= tol) ? lastPH : na
+eqLow  = (not na(lastPL) and not na(prevPL) and math.abs(lastPL - prevPL) <= tol) ? lastPL : na
+
+//────────────────────────────────────────────────────────────
+// NEAREST SWEPT LIQUIDITY
+//────────────────────────────────────────────────────────────
+pickNearestSweptLow(pClose) =>
+    float best = na
+    float bestDist = na
+
+    float c1 = prevDayL
+    float c2 = prevWkL
+    float c3 = curDayL
+    float c4 = lastPL
+    float c5 = eqLow
+    float c6 = adrL
+
+    if not na(c1) and low < c1 and close > c1
+        d = math.abs(pClose - c1)
+        if na(bestDist) or d < bestDist
+            best := c1
+            bestDist := d
+    if not na(c2) and low < c2 and close > c2
+        d = math.abs(pClose - c2)
+        if na(bestDist) or d < bestDist
+            best := c2
+            bestDist := d
+    if not na(c3) and low < c3 and close > c3
+        d = math.abs(pClose - c3)
+        if na(bestDist) or d < bestDist
+            best := c3
+            bestDist := d
+    if not na(c4) and low < c4 and close > c4
+        d = math.abs(pClose - c4)
+        if na(bestDist) or d < bestDist
+            best := c4
+            bestDist := d
+    if not na(c5) and low < c5 and close > c5
+        d = math.abs(pClose - c5)
+        if na(bestDist) or d < bestDist
+            best := c5
+            bestDist := d
+    if not na(c6) and low < c6 and close > c6
+        d = math.abs(pClose - c6)
+        if na(bestDist) or d < bestDist
+            best := c6
+            bestDist := d
+
+    [best, bestDist]
+
+pickNearestSweptHigh(pClose) =>
+    float best = na
+    float bestDist = na
+
+    float c1 = prevDayH
+    float c2 = prevWkH
+    float c3 = curDayH
+    float c4 = lastPH
+    float c5 = eqHigh
+    float c6 = adrU
+
+    if not na(c1) and high > c1 and close < c1
+        d = math.abs(pClose - c1)
+        if na(bestDist) or d < bestDist
+            best := c1
+            bestDist := d
+    if not na(c2) and high > c2 and close < c2
+        d = math.abs(pClose - c2)
+        if na(bestDist) or d < bestDist
+            best := c2
+            bestDist := d
+    if not na(c3) and high > c3 and close < c3
+        d = math.abs(pClose - c3)
+        if na(bestDist) or d < bestDist
+            best := c3
+            bestDist := d
+    if not na(c4) and high > c4 and close < c4
+        d = math.abs(pClose - c4)
+        if na(bestDist) or d < bestDist
+            best := c4
+            bestDist := d
+    if not na(c5) and high > c5 and close < c5
+        d = math.abs(pClose - c5)
+        if na(bestDist) or d < bestDist
+            best := c5
+            bestDist := d
+    if not na(c6) and high > c6 and close < c6
+        d = math.abs(pClose - c6)
+        if na(bestDist) or d < bestDist
+            best := c6
+            bestDist := d
+
+    [best, bestDist]
+
+[liqLow, lowDist]   = pickNearestSweptLow(close)
+[liqHigh, highDist] = pickNearestSweptHigh(close)
+
+haveLiqLong  = not na(liqLow)
+haveLiqShort = not na(liqHigh)
+
+dirLong  = haveLiqLong and (not haveLiqShort or lowDist <= highDist)
+dirShort = haveLiqShort and (not haveLiqLong or highDist < lowDist)
+
+insideHTF = haveRange and close >= rangeLow and close <= rangeHigh
+
+//────────────────────────────────────────────────────────────
+// MID + MOMENTUM
+//────────────────────────────────────────────────────────────
+midOKLong  = not requireMidConfirm or (haveRange and close >= mid)
+midOKShort = not requireMidConfirm or (haveRange and close <= mid)
+
+mom = ta.change(close, momLen)
+momOKLong  = not useMomentumConfirm or mom >= momMin
+momOKShort = not useMomentumConfirm or mom <= -momMin
+
+longTriggerBar  = dirLong  and insideHTF and midOKLong  and momOKLong
+shortTriggerBar = dirShort and insideHTF and midOKShort and momOKShort
+
+//────────────────────────────────────────────────────────────
+// STATE
+//────────────────────────────────────────────────────────────
+var int   state   = 0
+var float aEntry  = na
+var float aStop   = na
+var float aTP1    = na
+var float aTP2    = na
+var int   trigBar = na
+
+var int wins = 0
+var int losses = 0
+
+if longTriggerBar and haveRange
+    state   := 1
+    aEntry  := entryLong
+    aStop   := stopLong
+    aTP1    := tp1Level
+    aTP2    := tp2Long
+    trigBar := bar_index
+
+if shortTriggerBar and haveRange
+    state   := 2
+    aEntry  := entryShort
+    aStop   := stopShort
+    aTP1    := tp1Level
+    aTP2    := tp2Short
+    trigBar := bar_index
+
+enterLong  = (state == 1) and touchOrClose(aEntry, entryIsTouch)
+enterShort = (state == 2) and touchOrClose(aEntry, entryIsTouch)
+
+if enterLong
+    state := 3
+if enterShort
+    state := 4
+
+inLong  = state == 3
+inShort = state == 4
+
+hitStop = (inLong and touch(aStop)) or (inShort and touch(aStop))
+hitTP2  = (inLong and touch(aTP2))  or (inShort and touch(aTP2))
+
+if inLong or inShort
+    if hitStop
+        losses += 1
+        state := 0
+        aEntry := na
+        aStop  := na
+        aTP1   := na
+        aTP2   := na
+        trigBar := na
+    else if hitTP2
+        wins += 1
+        state := 0
+        aEntry := na
+        aStop  := na
+        aTP1   := na
+        aTP2   := na
+        trigBar := na
+
+total = wins + losses
+winRate = total > 0 ? (float(wins) / float(total)) * 100.0 : na
+
+potentialMovePct = (state != 0 and not na(aEntry) and not na(aTP2)) ? math.abs((aTP2 - aEntry) / aEntry) * 100.0 : na
+
+distToTP2 = (inLong and not na(aTP2)) ? (aTP2 - aEntry) :(inShort and not na(aTP2)) ? (aEntry - aTP2) : na
+distNow   = (inLong and not na(aEntry)) ? (close - aEntry) :(inShort and not na(aEntry)) ? (aEntry - close) : na
+
+progress = (inLong or inShort) and not na(distToTP2) and distToTP2 != 0 ? clamp01(distNow / distToTP2) : na
+progressPct = na(progress) ? na : progress * 100.0
+
+blocks = na(progress) ? 0 : int(math.round(progress * 10.0))
+barStr = ""
+for i = 0 to 9
+    barStr += i < blocks ? "█" : "░"
+
+roundedTP1 = na(aTP1) ? na : math.round(aTP1)
+suggested = na(roundedTP1) ? "—" :
+     ((state == 2 or state == 4) ? ("$" + str.tostring(roundedTP1) + "p") :
+      (state == 1 or state == 3) ? ("$" + str.tostring(roundedTP1) + "c") :
+      ("$" + str.tostring(roundedTP1)))
+
+//────────────────────────────────────────────────────────────
+// OVERLAY
+//────────────────────────────────────────────────────────────
+var box bxProfit = na
+var box bxRisk   = na
+var label lbEntry = na
+var label lbStop  = na
+var label lbTP1   = na
+var label lbTP2   = na
+
+needOverlay = qbShowOverlay and (state != 0) and not na(trigBar)
+
+if not needOverlay
+    if not na(bxProfit)
+        box.delete(bxProfit)
+    if not na(bxRisk)
+        box.delete(bxRisk)
+    if not na(lbEntry)
+        label.delete(lbEntry)
+    if not na(lbStop)
+        label.delete(lbStop)
+    if not na(lbTP1)
+        label.delete(lbTP1)
+    if not na(lbTP2)
+        label.delete(lbTP2)
+    bxProfit := na
+    bxRisk := na
+    lbEntry := na
+    lbStop := na
+    lbTP1 := na
+    lbTP2 := na
+else
+    leftX  = trigBar
+    rightX = math.min(trigBar + overlayMaxBars, bar_index)
+
+    profitTop = math.max(aEntry, aTP2)
+    profitBot = math.min(aEntry, aTP2)
+
+    riskTop   = math.max(aEntry, aStop)
+    riskBot   = math.min(aEntry, aStop)
+
+    if na(bxProfit)
+        bxProfit := box.new(leftX, profitTop, rightX, profitBot,
+            bgcolor=color.new(color.green, 82),
+            border_color=color.new(color.green, 0),
+            xloc=xloc.bar_index)
+
+        bxRisk := box.new(leftX, riskTop, rightX, riskBot,
+            bgcolor=color.new(color.red, 78),
+            border_color=color.new(color.red, 0),
+            xloc=xloc.bar_index)
+
+        lbEntry := label.new(leftX, aEntry, "Entry " + fmt(aEntry), textcolor=color.white, style=label.style_none, size=size.tiny, color=color.new(color.white, 100))
+        lbStop  := label.new(leftX, aStop,  "Stop "  + fmt(aStop),  textcolor=color.white, style=label.style_none, size=size.tiny, color=color.new(color.white, 100))
+        lbTP1   := label.new(leftX, aTP1,   "TP1 "   + fmt(aTP1),   textcolor=color.white, style=label.style_none, size=size.tiny, color=color.new(color.white, 100))
+        lbTP2   := label.new(leftX, aTP2,   "TP2 "   + fmt(aTP2),   textcolor=color.white, style=label.style_none, size=size.tiny, color=color.new(color.white, 100))
+    else
+        box.set_left(bxProfit, leftX)
+        box.set_right(bxProfit, rightX)
+        box.set_top(bxProfit, profitTop)
+        box.set_bottom(bxProfit, profitBot)
+
+        box.set_left(bxRisk, leftX)
+        box.set_right(bxRisk, rightX)
+        box.set_top(bxRisk, riskTop)
+        box.set_bottom(bxRisk, riskBot)
+
+        label.set_x(lbEntry, leftX)
+        label.set_y(lbEntry, aEntry)
+        label.set_text(lbEntry, "Entry " + fmt(aEntry))
+
+        label.set_x(lbStop, leftX)
+        label.set_y(lbStop, aStop)
+        label.set_text(lbStop, "Stop " + fmt(aStop))
+
+        label.set_x(lbTP1, leftX)
+        label.set_y(lbTP1, aTP1)
+        label.set_text(lbTP1, "TP1 " + fmt(aTP1))
+
+        label.set_x(lbTP2, leftX)
+        label.set_y(lbTP2, aTP2)
+        label.set_text(lbTP2, "TP2 " + fmt(aTP2))
+
+//────────────────────────────────────────────────────────────
+// TABLE
+//────────────────────────────────────────────────────────────
+var table t = na
+if qbShowTable and na(t)
+    t := table.new(f_pos(tblPosOpt), 4, 7, border_width=1)
+
+if qbShowTable and not na(t)
+    table.clear(t, 0, 0, 3, 6)
+
+    ts = f_sz(tblSizeOpt)
+
+    bgTitle = color.new(color.black, 0)
+    bgHdr   = color.new(color.gray, 75)
+    bgCell  = color.new(color.black, 15)
+    txtBlue = color.rgb(120, 200, 255)
+
+    table.cell(t, 0, 0, "Quarterback Sweep Pro  🏈", text_color=txtBlue, bgcolor=bgTitle, text_size=ts, text_halign=text.align_center)
+    table.cell(t, 1, 0, "", bgcolor=bgTitle)
+    table.cell(t, 2, 0, "", bgcolor=bgTitle)
+    table.cell(t, 3, 0, "", bgcolor=bgTitle)
+
+    rangeStr = haveRange ? (fmt(rangeLow) + " - " + fmt(rangeHigh)) : "—"
+    table.cell(t, 0, 1, "Timeframe", text_color=color.white, bgcolor=bgHdr, text_size=ts)
+    table.cell(t, 1, 1, refTF,       text_color=txtBlue, bgcolor=bgCell, text_size=ts)
+    table.cell(t, 2, 1, "Price Range", text_color=color.white, bgcolor=bgHdr, text_size=ts)
+    table.cell(t, 3, 1, rangeStr,      text_color=color.white, bgcolor=bgCell, text_size=ts)
+
+    statusTxt = state == 0 ? "WAIT" : state == 1 ? "LONG TRIGGER" : state == 2 ? "SHORT TRIGGER" : state == 3 ? "LONG ACTIVE" : "SHORT ACTIVE"
+    statusCol = state == 0 ? color.yellow : (state == 1 or state == 3) ? color.lime : color.red
+
+    table.cell(t, 0, 2, "Trade Status", text_color=color.white, bgcolor=bgHdr, text_size=ts)
+    table.cell(t, 1, 2, statusTxt, text_color=statusCol, bgcolor=bgCell, text_size=ts, text_halign=text.align_center)
+    table.cell(t, 2, 2, "", bgcolor=bgCell)
+    table.cell(t, 3, 2, "", bgcolor=bgCell)
+
+    showVals = state != 0
+
+    table.cell(t, 0, 3, "Entry", text_color=color.white, bgcolor=bgHdr, text_size=ts)
+    table.cell(t, 1, 3, showVals ? fmt(aEntry) : "—", text_color=color.white, bgcolor=bgCell, text_size=ts)
+    table.cell(t, 2, 3, "🛑 Stop", text_color=color.white, bgcolor=bgHdr, text_size=ts)
+    table.cell(t, 3, 3, showVals ? fmt(aStop) : "—", text_color=(hitStop ? color.red : color.white), bgcolor=bgCell, text_size=ts)
+
+    table.cell(t, 0, 4, "TP1 (50%)", text_color=color.white, bgcolor=bgHdr, text_size=ts)
+    table.cell(t, 1, 4, showVals ? fmt(aTP1) : "—", text_color=color.white, bgcolor=bgCell, text_size=ts)
+    table.cell(t, 2, 4, "TP2 (100%)", text_color=color.white, bgcolor=bgHdr, text_size=ts)
+    table.cell(t, 3, 4, showVals ? fmt(aTP2) : "—", text_color=color.white, bgcolor=bgCell, text_size=ts)
+
+    actBg = inLong ? color.new(color.green, 70) : inShort ? color.new(color.red, 70) : bgCell
+    actStr = (inLong or inShort) and not na(progressPct) ? (barStr + " " + str.tostring(progressPct, "#.##") + "%") : "—"
+    table.cell(t, 0, 5, "Actual Move", text_color=color.white, bgcolor=bgHdr, text_size=ts)
+    table.cell(t, 1, 5, actStr, text_color=color.white, bgcolor=actBg, text_size=ts, text_halign=text.align_left)
+    table.cell(t, 2, 5, "", bgcolor=actBg)
+    table.cell(t, 3, 5, "", bgcolor=actBg)
+
+    potStr = showVals and not na(potentialMovePct) ? (str.tostring(potentialMovePct, "#.##") + "%") : "—"
+    wrStr  = na(winRate) ? "—" : (str.tostring(winRate, "#.##") + "%")
+
+    table.cell(t, 0, 6, "💡 Suggested", text_color=color.white, bgcolor=bgHdr, text_size=ts)
+    table.cell(t, 1, 6, showVals ? suggested : "—", text_color=color.white, bgcolor=bgCell, text_size=ts)
+    table.cell(t, 2, 6, "Potential | Win", text_color=color.white, bgcolor=bgHdr, text_size=ts)
+    table.cell(t, 3, 6, potStr + " | " + wrStr, text_color=color.white, bgcolor=bgCell, text_size=ts)
